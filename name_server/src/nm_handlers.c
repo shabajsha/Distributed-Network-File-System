@@ -4,6 +4,21 @@
 #include "nm_metadata.h"
 #include "nm_network.h"
 
+static int safe_append(char *dest, size_t dest_size, const char *src) {
+    if (!dest || !src || dest_size == 0) {
+        return 0;
+    }
+
+    size_t used = strlen(dest);
+    size_t add = strlen(src);
+    if (used + add >= dest_size) {
+        return 0;
+    }
+
+    memcpy(dest + used, src, add + 1);
+    return 1;
+}
+
 void handle_register_client(int client_fd, const char *request, const char *client_ip) {
     char username[MAX_USERNAME] = {0};
     parse_json_string(request, "username", username, sizeof(username));
@@ -233,7 +248,10 @@ void handle_view(int client_fd, const char *request, const char *username) {
     int show_details = (strstr(flags, "l") != NULL);
 
     char response[BUFFER_SIZE] = {0};
-    strcpy(response, "{\"status\":\"OK\",\"files\":[");
+    if (!safe_append(response, sizeof(response), "{\"status\":\"OK\",\"files\":[")) {
+        send_response(client_fd, "{\"status\":\"ERR\",\"reason\":\"RESPONSE_BUILD_FAILED\"}");
+        return;
+    }
 
     pthread_mutex_lock(&files_mutex);
 
@@ -246,7 +264,11 @@ void handle_view(int client_fd, const char *request, const char *username) {
                 int has_access = show_all || check_access(file, username, "R");
                 if (has_access) {
                     if (!first) {
-                        strcat(response, ",");
+                        if (!safe_append(response, sizeof(response), ",")) {
+                            pthread_mutex_unlock(&files_mutex);
+                            send_response(client_fd, "{\"status\":\"ERR\",\"reason\":\"RESPONSE_TOO_LARGE\"}");
+                            return;
+                        }
                     }
                     first = 0;
 
@@ -276,11 +298,19 @@ void handle_view(int client_fd, const char *request, const char *username) {
                         snprintf(entry, sizeof(entry),
                                  "{\"filename\":\"%s\",\"owner\":\"%s\",\"words\":%d,\"chars\":%d,\"bytes\":%d,\"last_accessed\":\"%s\"}",
                                  file->filename, file->owner, words, chars, bytes, timestamp);
-                        strcat(response, entry);
+                        if (!safe_append(response, sizeof(response), entry)) {
+                            pthread_mutex_unlock(&files_mutex);
+                            send_response(client_fd, "{\"status\":\"ERR\",\"reason\":\"RESPONSE_TOO_LARGE\"}");
+                            return;
+                        }
                     } else {
                         char entry[300];
                         snprintf(entry, sizeof(entry), "\"%s\"", file->filename);
-                        strcat(response, entry);
+                        if (!safe_append(response, sizeof(response), entry)) {
+                            pthread_mutex_unlock(&files_mutex);
+                            send_response(client_fd, "{\"status\":\"ERR\",\"reason\":\"RESPONSE_TOO_LARGE\"}");
+                            return;
+                        }
                     }
                 }
             }
@@ -288,7 +318,11 @@ void handle_view(int client_fd, const char *request, const char *username) {
         }
     }
 
-    strcat(response, "]}");
+    if (!safe_append(response, sizeof(response), "]}")) {
+        pthread_mutex_unlock(&files_mutex);
+        send_response(client_fd, "{\"status\":\"ERR\",\"reason\":\"RESPONSE_TOO_LARGE\"}");
+        return;
+    }
     pthread_mutex_unlock(&files_mutex);
 
     log_message("INFO", "VIEW command executed", "0.0.0.0", 0, username);
@@ -296,23 +330,39 @@ void handle_view(int client_fd, const char *request, const char *username) {
 }
 
 void handle_list(int client_fd, const char *username) {
-    char response[BUFFER_SIZE] = "{\"status\":\"OK\",\"users\":[";
+    char response[BUFFER_SIZE] = {0};
+    if (!safe_append(response, sizeof(response), "{\"status\":\"OK\",\"users\":[")) {
+        send_response(client_fd, "{\"status\":\"ERR\",\"reason\":\"RESPONSE_BUILD_FAILED\"}");
+        return;
+    }
 
     pthread_mutex_lock(&clients_mutex);
 
     int first = 1;
     for (int i = 0; i < client_count; i++) {
         if (!first) {
-            strcat(response, ",");
+            if (!safe_append(response, sizeof(response), ",")) {
+                pthread_mutex_unlock(&clients_mutex);
+                send_response(client_fd, "{\"status\":\"ERR\",\"reason\":\"RESPONSE_TOO_LARGE\"}");
+                return;
+            }
         }
         first = 0;
 
         char entry[128];
         snprintf(entry, sizeof(entry), "\"%s\"", clients[i].username);
-        strcat(response, entry);
+        if (!safe_append(response, sizeof(response), entry)) {
+            pthread_mutex_unlock(&clients_mutex);
+            send_response(client_fd, "{\"status\":\"ERR\",\"reason\":\"RESPONSE_TOO_LARGE\"}");
+            return;
+        }
     }
 
-    strcat(response, "]}");
+    if (!safe_append(response, sizeof(response), "]}")) {
+        pthread_mutex_unlock(&clients_mutex);
+        send_response(client_fd, "{\"status\":\"ERR\",\"reason\":\"RESPONSE_TOO_LARGE\"}");
+        return;
+    }
     pthread_mutex_unlock(&clients_mutex);
 
     log_message("INFO", "LIST command executed", "0.0.0.0", 0, username);
@@ -610,20 +660,36 @@ void handle_info(int client_fd, const char *request, const char *username) {
 
     char access_json[1024];
     access_json[0] = '\0';
-    strcat(access_json, "[");
+    if (!safe_append(access_json, sizeof(access_json), "[")) {
+        send_response(client_fd, "{\"status\":\"ERR\",\"reason\":\"RESPONSE_BUILD_FAILED\"}");
+        pthread_mutex_unlock(&files_mutex);
+        return;
+    }
 
     char temp[256];
     snprintf(temp, sizeof(temp), "{\"user\":\"%s\",\"mode\":\"RW\"}", file->owner);
-    strcat(access_json, temp);
+    if (!safe_append(access_json, sizeof(access_json), temp)) {
+        send_response(client_fd, "{\"status\":\"ERR\",\"reason\":\"ACCESS_LIST_TOO_LARGE\"}");
+        pthread_mutex_unlock(&files_mutex);
+        return;
+    }
 
     AccessEntry *entry = file->access_list;
     while (entry) {
         snprintf(temp, sizeof(temp), ",{\"user\":\"%s\",\"mode\":\"%s\"}", entry->username, entry->mode);
-        strcat(access_json, temp);
+        if (!safe_append(access_json, sizeof(access_json), temp)) {
+            send_response(client_fd, "{\"status\":\"ERR\",\"reason\":\"ACCESS_LIST_TOO_LARGE\"}");
+            pthread_mutex_unlock(&files_mutex);
+            return;
+        }
         entry = entry->next;
     }
 
-    strcat(access_json, "]");
+    if (!safe_append(access_json, sizeof(access_json), "]")) {
+        send_response(client_fd, "{\"status\":\"ERR\",\"reason\":\"ACCESS_LIST_TOO_LARGE\"}");
+        pthread_mutex_unlock(&files_mutex);
+        return;
+    }
 
     char created_str[64];
     char modified_str[64];
@@ -677,10 +743,14 @@ void handle_info(int client_fd, const char *request, const char *username) {
     }
 
     char response[BUFFER_SIZE];
-    snprintf(response, sizeof(response),
-             "{\"status\":\"OK\",\"filename\":\"%s\",\"owner\":\"%s\",\"created_at\":\"%s\",\"last_modified\":\"%s\",\"last_accessed\":\"%s\",\"last_accessed_by\":\"%s\",\"words\":%d,\"chars\":%d,\"bytes\":%d,\"access\":%s,\"ss_ip\":\"%s\",\"ss_port\":%d}",
-             filename, file_owner, created_str, modified_str, accessed_str, last_accessed_by,
-             words, chars, bytes, access_json, file_ss_ip, file_ss_port);
+    int response_len = snprintf(response, sizeof(response),
+                                "{\"status\":\"OK\",\"filename\":\"%s\",\"owner\":\"%s\",\"created_at\":\"%s\",\"last_modified\":\"%s\",\"last_accessed\":\"%s\",\"last_accessed_by\":\"%s\",\"words\":%d,\"chars\":%d,\"bytes\":%d,\"access\":%s,\"ss_ip\":\"%s\",\"ss_port\":%d}",
+                                filename, file_owner, created_str, modified_str, accessed_str, last_accessed_by,
+                                words, chars, bytes, access_json, file_ss_ip, file_ss_port);
+    if (response_len < 0 || response_len >= (int)sizeof(response)) {
+        send_response(client_fd, "{\"status\":\"ERR\",\"reason\":\"RESPONSE_TOO_LARGE\"}");
+        return;
+    }
 
     log_message("INFO", "INFO command executed", "0.0.0.0", 0, username);
     send_response(client_fd, response);
@@ -1023,19 +1093,22 @@ void handle_exec(int client_fd, const char *request, const char *username) {
     }
     ss_response[bytes_read] = '\0';
 
-    char content[BUFFER_SIZE] = {0};
-    const char *content_start = strstr(ss_response, "\"content\":\"");
-    if (content_start) {
-        content_start += 11;
-        const char *content_end = strchr(content_start, '"');
-        if (content_end) {
-            int content_len = (int)(content_end - content_start);
-            if (content_len < BUFFER_SIZE) {
-                strncpy(content, content_start, content_len);
-                content[content_len] = '\0';
-            }
+    if (strstr(ss_response, "\"status\":\"ERR\"")) {
+        char reason[128] = {0};
+        parse_json_string(ss_response, "reason", reason, sizeof(reason));
+        free(ss_response);
+        if (reason[0] == '\0') {
+            send_response(client_fd, "{\"status\":\"ERR\",\"reason\":\"SS_READ_FAILED\"}");
+        } else {
+            char err_response[256];
+            snprintf(err_response, sizeof(err_response), "{\"status\":\"ERR\",\"reason\":\"%s\"}", reason);
+            send_response(client_fd, err_response);
         }
+        return;
     }
+
+    char content[BUFFER_SIZE] = {0};
+    parse_json_string(ss_response, "content", content, sizeof(content));
 
     free(ss_response);
 
@@ -1109,14 +1182,15 @@ void handle_exec(int client_fd, const char *request, const char *username) {
     escaped_output[k] = '\0';
 
     char response[BUFFER_SIZE * 3];
+    int final_exit = WIFEXITED(exit_code) ? WEXITSTATUS(exit_code) : 1;
     snprintf(response, sizeof(response),
              "{\"status\":\"OK\",\"output\":\"%s\",\"exit_code\":%d}",
-             escaped_output, WEXITSTATUS(exit_code));
+             escaped_output, final_exit);
     send_response(client_fd, response);
 
     char log_msg[512];
     snprintf(log_msg, sizeof(log_msg), "EXEC: %s by %s (exit_code=%d)",
-             filename, username, WEXITSTATUS(exit_code));
+             filename, username, final_exit);
     log_message("INFO", log_msg, "0.0.0.0", 0, username);
 
     save_metadata();

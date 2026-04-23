@@ -75,26 +75,26 @@ int main(int argc, char *argv[]) {
         }
 
         char cmd[64] = {0};
-        sscanf(input, "%s", cmd);
+        sscanf(input, "%63s", cmd);
 
         if (strcmp(cmd, "help") == 0) {
             print_help();
         } else if (strcmp(cmd, "VIEW") == 0) {
             char flags[16] = {0};
-            sscanf(input, "VIEW %s", flags);
+            sscanf(input, "VIEW %15s", flags);
             handle_view(flags);
         } else if (strcmp(cmd, "LIST") == 0) {
             handle_list();
         } else if (strcmp(cmd, "CREATE") == 0) {
             char filename[MAX_FILENAME];
-            if (sscanf(input, "CREATE %s", filename) == 1) {
+            if (sscanf(input, "CREATE %255s", filename) == 1) {
                 handle_create(filename);
             } else {
                 printf("Usage: CREATE <filename>\n");
             }
         } else if (strcmp(cmd, "INFO") == 0) {
             char filename[MAX_FILENAME];
-            if (sscanf(input, "INFO %s", filename) == 1) {
+            if (sscanf(input, "INFO %255s", filename) == 1) {
                 handle_info(filename);
             } else {
                 printf("Usage: INFO <filename>\n");
@@ -103,7 +103,7 @@ int main(int argc, char *argv[]) {
             char mode_flag[4];
             char filename[MAX_FILENAME];
             char target[MAX_USERNAME];
-            if (sscanf(input, "ADDACCESS %s %s %s", mode_flag, filename, target) == 3) {
+            if (sscanf(input, "ADDACCESS %3s %255s %63s", mode_flag, filename, target) == 3) {
                 char mode[3] = {0};
                 if (strcmp(mode_flag, "-R") == 0) {
                     strcpy(mode, "R");
@@ -120,14 +120,14 @@ int main(int argc, char *argv[]) {
         } else if (strcmp(cmd, "REMACCESS") == 0) {
             char filename[MAX_FILENAME];
             char target[MAX_USERNAME];
-            if (sscanf(input, "REMACCESS %s %s", filename, target) == 2) {
+            if (sscanf(input, "REMACCESS %255s %63s", filename, target) == 2) {
                 handle_remaccess(filename, target);
             } else {
                 printf("Usage: REMACCESS <filename> <username>\n");
             }
         } else if (strcmp(cmd, "READ") == 0) {
             char filename[MAX_FILENAME];
-            if (sscanf(input, "READ %s", filename) == 1) {
+            if (sscanf(input, "READ %255s", filename) == 1) {
                 handle_read(filename);
             } else {
                 printf("Usage: READ <filename>\n");
@@ -135,35 +135,35 @@ int main(int argc, char *argv[]) {
         } else if (strcmp(cmd, "WRITE") == 0) {
             char filename[MAX_FILENAME];
             int sentence_index = 0;
-            if (sscanf(input, "WRITE %s %d", filename, &sentence_index) == 2) {
+            if (sscanf(input, "WRITE %255s %d", filename, &sentence_index) == 2) {
                 handle_write(filename, sentence_index);
             } else {
                 printf("Usage: WRITE <filename> <sentence_number>\n");
             }
         } else if (strcmp(cmd, "STREAM") == 0) {
             char filename[MAX_FILENAME];
-            if (sscanf(input, "STREAM %s", filename) == 1) {
+            if (sscanf(input, "STREAM %255s", filename) == 1) {
                 handle_stream(filename);
             } else {
                 printf("Usage: STREAM <filename>\n");
             }
         } else if (strcmp(cmd, "UNDO") == 0) {
             char filename[MAX_FILENAME];
-            if (sscanf(input, "UNDO %s", filename) == 1) {
+            if (sscanf(input, "UNDO %255s", filename) == 1) {
                 handle_undo(filename);
             } else {
                 printf("Usage: UNDO <filename>\n");
             }
         } else if (strcmp(cmd, "DELETE") == 0) {
             char filename[MAX_FILENAME];
-            if (sscanf(input, "DELETE %s", filename) == 1) {
+            if (sscanf(input, "DELETE %255s", filename) == 1) {
                 handle_delete(filename);
             } else {
                 printf("Usage: DELETE <filename>\n");
             }
         } else if (strcmp(cmd, "EXEC") == 0) {
             char filename[MAX_FILENAME];
-            if (sscanf(input, "EXEC %s", filename) == 1) {
+            if (sscanf(input, "EXEC %255s", filename) == 1) {
                 handle_exec(filename);
             } else {
                 printf("Usage: EXEC <filename>\n");
