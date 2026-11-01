@@ -1,85 +1,112 @@
 //AI code starts
 #include "client_network.h"
+#include "client_utils.h"
 
-int connect_to_nm(void) {
-    int sock = socket(AF_INET, SOCK_STREAM, 0);
-    if (sock < 0) {
-        perror("Socket creation failed");
-        return -1;
+int conn_open(Conn *conn, const char *ip, int port) {
+    conn->fd = dnfs_connect(ip, port, 30);
+    if (conn->fd < 0) {
+        return 0;
     }
-
-    struct sockaddr_in server_addr;
-    server_addr.sin_family = AF_INET;
-    server_addr.sin_port = htons(NM_PORT);
-
-    if (inet_pton(AF_INET, NM_IP, &server_addr.sin_addr) <= 0) {
-        perror("Invalid address");
-        close(sock);
-        return -1;
-    }
-
-    if (connect(sock, (struct sockaddr *)&server_addr, sizeof(server_addr)) < 0) {
-        perror("Connection to Name Server failed");
-        close(sock);
-        return -1;
-    }
-
-    return sock;
+    line_reader_init(&conn->reader, conn->fd);
+    return 1;
 }
 
-int connect_to_ss(const char *ip, int port) {
-    int sock = socket(AF_INET, SOCK_STREAM, 0);
-    if (sock < 0) {
-        perror("Socket creation failed");
-        return -1;
-    }
-
-    struct sockaddr_in server_addr;
-    server_addr.sin_family = AF_INET;
-    server_addr.sin_port = htons(port);
-
-    if (inet_pton(AF_INET, ip, &server_addr.sin_addr) <= 0) {
-        perror("Invalid address");
-        close(sock);
-        return -1;
-    }
-
-    if (connect(sock, (struct sockaddr *)&server_addr, sizeof(server_addr)) < 0) {
-        perror("Connection to Storage Server failed");
-        close(sock);
-        return -1;
-    }
-
-    return sock;
+int conn_send(Conn *conn, const char *message) {
+    return dnfs_send_line(conn->fd, message) == 0;
 }
 
-void send_message(int fd, const char *message) {
-    size_t len = strlen(message);
-    char *payload = (char *)malloc(len + 2);
-    if (!payload) {
-        send(fd, message, len, 0);
-        return;
-    }
-    memcpy(payload, message, len);
-    payload[len] = '\n';
-    payload[len + 1] = '\0';
-    send(fd, payload, len + 1, 0);
-    free(payload);
+/* Returns the next reply line (caller frees), or NULL if the server closed
+ * the connection or stopped answering. */
+char *conn_recv(Conn *conn) {
+    return line_reader_next(&conn->reader);
 }
 
-char *receive_message(int fd) {
-    char *buffer = (char *)malloc(BUFFER_SIZE);
-    if (!buffer) {
+void conn_close(Conn *conn) {
+    line_reader_free(&conn->reader);
+    if (conn->fd >= 0) {
+        close(conn->fd);
+    }
+    conn->fd = -1;
+}
+
+/* Sends one request on a fresh connection to the name server and returns
+ * its reply. */
+static char *nm_request(const char *request) {
+    Conn conn;
+    if (!conn_open(&conn, NM_IP, dnfs_nm_port())) {
+        printf("Error: Could not connect to Name Server at %s:%d\n", NM_IP, dnfs_nm_port());
         return NULL;
     }
+    char *response = NULL;
+    if (conn_send(&conn, request)) {
+        response = conn_recv(&conn);
+    }
+    conn_close(&conn);
+    if (!response) {
+        printf("Error: No response from Name Server\n");
+    }
+    return response;
+}
 
-    int bytes_read = recv(fd, buffer, BUFFER_SIZE - 1, 0);
-    if (bytes_read <= 0) {
-        free(buffer);
-        return NULL;
+/* Logs in with the stored username and password and keeps the token. */
+int login(void) {
+    StrBuf sb;
+    sb_init(&sb);
+    sb_append(&sb, "{\"cmd\":\"register_client\",\"username\":");
+    sb_append_json(&sb, current_username);
+    sb_append(&sb, ",\"password\":");
+    sb_append_json(&sb, current_password);
+    sb_append(&sb, "}");
+    char *request = sb_take(&sb);
+    if (!request) {
+        return 0;
     }
 
-    buffer[bytes_read] = '\0';
-    return buffer;
+    char *response = nm_request(request);
+    free(request);
+    if (!response) {
+        return 0;
+    }
+    int ok = response_is_ok(response) &&
+             json_get_str(response, "token", session_token, sizeof(session_token));
+    if (!ok) {
+        print_error(response, "Login failed");
+    }
+    free(response);
+    return ok;
+}
+
+/* Sends {"cmd":cmd,"token":...<fields>} to the name server. If the name
+ * server restarted and forgot the session, logs in again once and retries. */
+char *nm_call(const char *cmd, const char *fields) {
+    for (int attempt = 0; attempt < 2; attempt++) {
+        StrBuf sb;
+        sb_init(&sb);
+        sb_appendf(&sb, "{\"cmd\":\"%s\",\"token\":\"%s\"", cmd, session_token);
+        sb_append(&sb, fields);
+        sb_append(&sb, "}");
+        char *request = sb_take(&sb);
+        if (!request) {
+            return NULL;
+        }
+
+        char *response = nm_request(request);
+        free(request);
+        if (!response) {
+            return NULL;
+        }
+
+        char reason[64] = {0};
+        json_get_str(response, "reason", reason, sizeof(reason));
+        if (attempt == 0 && strcmp(reason, "UNAUTHENTICATED") == 0) {
+            free(response);
+            if (!login()) {
+                return NULL;
+            }
+            continue;
+        }
+        return response;
+    }
+    return NULL;
 }
 //AI code ends

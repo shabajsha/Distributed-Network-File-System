@@ -17,21 +17,25 @@
 #include <stdbool.h>
 #include <time.h>
 
+#include "dnfs_shared.h"
+
 // Constants
-#define NM_PORT 9000
 #define MAX_FILENAME 256
 #define MAX_MSG 4096
 #define MAX_LOCKS 128
 #define MAX_USERNAME 64
+#define SECRET_LEN 128
+#define MAX_CONNECTION_THREADS 256
 
 // Global path variables
-extern char BASE_DIR[1024];
-extern char DATA_DIR[1024];
-extern char SNAP_DIR[1024];
-extern char LOG_DIR[1024];
+extern char BASE_DIR[256];
+extern char DATA_DIR[512];
+extern char SNAP_DIR[512];
+extern char LOG_DIR[512];
 extern char NM_IP[INET_ADDRSTRLEN];
 extern char ADVERTISE_IP[INET_ADDRSTRLEN];
 extern int CLIENT_PORT;
+extern char SS_SECRET[SECRET_LEN];
 
 // Logging context (thread-local)
 typedef struct {

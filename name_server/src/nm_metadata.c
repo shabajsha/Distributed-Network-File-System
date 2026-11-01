@@ -1,5 +1,6 @@
 #include "nm_metadata.h"
 #include "nm_cache.h"
+#include "nm_logging.h"
 
 static unsigned int hash_function(const char *str) {
     unsigned int hash = 5381;
@@ -7,7 +8,22 @@ static unsigned int hash_function(const char *str) {
     while (str && (c = *str++)) {
         hash = ((hash << 5) + hash) + (unsigned int)c;
     }
-    return hash % MAX_FILES;
+    return hash % HASH_BUCKETS;
+}
+
+/* Finds a file whatever its state, including one still being created. */
+FileMetadata *find_any_file(const char *filename) {
+    if (!filename) {
+        return NULL;
+    }
+    HashNode *node = file_hash_table[hash_function(filename)];
+    while (node) {
+        if (strcmp(node->key, filename) == 0) {
+            return node->file;
+        }
+        node = node->next;
+    }
+    return NULL;
 }
 
 FileMetadata *lookup_file(const char *filename) {
@@ -16,19 +32,14 @@ FileMetadata *lookup_file(const char *filename) {
     }
 
     FileMetadata *cached = cache_get(filename);
-    if (cached && cached->active) {
+    if (cached && !cached->pending) {
         return cached;
     }
 
-    unsigned int index = hash_function(filename);
-    HashNode *node = file_hash_table[index];
-
-    while (node) {
-        if (strcmp(node->key, filename) == 0 && node->file->active) {
-            cache_put(filename, node->file);
-            return node->file;
-        }
-        node = node->next;
+    FileMetadata *file = find_any_file(filename);
+    if (file && !file->pending) {
+        cache_put(filename, file);
+        return file;
     }
     return NULL;
 }
@@ -49,9 +60,42 @@ void insert_file(FileMetadata *file) {
     new_node->file = file;
     new_node->next = file_hash_table[index];
     file_hash_table[index] = new_node;
+    if (!file->pending) {
+        cache_put(file->filename, file);
+    }
+}
+
+void mark_file_ready(FileMetadata *file) {
+    file->pending = 0;
     cache_put(file->filename, file);
 }
 
+static void free_access_list(AccessEntry *entry) {
+    while (entry) {
+        AccessEntry *next = entry->next;
+        free(entry);
+        entry = next;
+    }
+}
+
+void remove_file(const char *filename) {
+    cache_remove(filename);
+
+    HashNode **link = &file_hash_table[hash_function(filename)];
+    while (*link) {
+        if (strcmp((*link)->key, filename) == 0) {
+            HashNode *node = *link;
+            *link = node->next;
+            free_access_list(node->file->access_list);
+            free(node->file);
+            free(node);
+            return;
+        }
+        link = &(*link)->next;
+    }
+}
+
+/* The owner can do anything; "W" access also allows reading. */
 int check_access(FileMetadata *file, const char *username, const char *required_mode) {
     if (!file || !username || !required_mode) {
         return 0;
@@ -61,265 +105,271 @@ int check_access(FileMetadata *file, const char *username, const char *required_
         return 1;
     }
 
-    AccessEntry *entry = file->access_list;
-    while (entry) {
+    for (AccessEntry *entry = file->access_list; entry; entry = entry->next) {
         if (strcmp(entry->username, username) == 0) {
             if (strcmp(required_mode, "R") == 0) {
-                return (strstr(entry->mode, "R") != NULL || strstr(entry->mode, "W") != NULL);
+                return strchr(entry->mode, 'R') != NULL || strchr(entry->mode, 'W') != NULL;
             }
             if (strcmp(required_mode, "W") == 0) {
-                return (strstr(entry->mode, "W") != NULL);
+                return strchr(entry->mode, 'W') != NULL;
             }
         }
-        entry = entry->next;
     }
     return 0;
 }
 
-static const char *skip_ws(const char *p) {
-    while (p && *p && (unsigned char)*p <= ' ') {
-        p++;
+int user_index(const char *username) {
+    for (int i = 0; i < user_count; i++) {
+        if (strcmp(users[i].username, username) == 0) {
+            return i;
+        }
     }
-    return p;
+    return -1;
 }
 
 void parse_json_string(const char *json, const char *key, char *value, int max_len) {
-    if (!json || !key || !value || max_len <= 0) {
+    if (!value || max_len <= 0) {
         return;
     }
-
-    char search_key[128];
-    snprintf(search_key, sizeof(search_key), "\"%s\"", key);
-
-    const char *pos = strstr(json, search_key);
-    if (!pos) {
-        return;
+    if (!json || !key || !json_get_str(json, key, value, (size_t)max_len)) {
+        value[0] = '\0';
     }
-
-    pos = strchr(pos, ':');
-    if (!pos) {
-        return;
-    }
-    pos++;
-
-    pos = skip_ws(pos);
-    if (*pos != '"') {
-        return;
-    }
-    pos++;
-
-    const char *end = pos;
-    while (*end && *end != '"') {
-        if (*end == '\\' && *(end + 1)) {
-            end += 2;
-            continue;
-        }
-        end++;
-    }
-    if (*end != '"') {
-        return;
-    }
-
-    int len = (int)(end - pos);
-    if (len >= max_len) {
-        len = max_len - 1;
-    }
-
-    int idx = 0;
-    while (pos < end && idx < len) {
-        if (*pos == '\\' && (pos + 1) < end) {
-            pos++;
-            switch (*pos) {
-                case 'n': value[idx++] = '\n'; break;
-                case 'r': value[idx++] = '\r'; break;
-                case 't': value[idx++] = '\t'; break;
-                case '\\': value[idx++] = '\\'; break;
-                case '"': value[idx++] = '"'; break;
-                case '/': value[idx++] = '/'; break;
-                default: value[idx++] = *pos; break;
-            }
-            pos++;
-        } else {
-            value[idx++] = *pos++;
-        }
-    }
-    value[idx] = '\0';
 }
 
 int parse_json_int(const char *json, const char *key) {
-    if (!json || !key) {
+    long value = 0;
+    if (!json || !key || !json_get_long(json, key, &value)) {
         return 0;
     }
-
-    char search_key[128];
-    snprintf(search_key, sizeof(search_key), "\"%s\"", key);
-
-    const char *pos = strstr(json, search_key);
-    if (!pos) {
-        return 0;
-    }
-
-    pos = strchr(pos, ':');
-    if (!pos) {
-        return 0;
-    }
-    pos++;
-
-    pos = skip_ws(pos);
-    return atoi(pos);
+    return (int)value;
 }
 
-int request_file_stats(const char *ip, int port, const char *filename,
-                       int *words, int *chars, int *bytes) {
-    if (!ip || !filename) {
-        return 0;
+/* Write to a temp file, fsync, then rename over the old file, so a crash
+ * leaves either the old metadata or the new, never half of it. */
+static int write_file_atomic(const char *path, const char *content) {
+    char tmp_path[1100];
+    snprintf(tmp_path, sizeof(tmp_path), "%s.tmpXXXXXX", path);
+    int fd = mkstemp(tmp_path);
+    if (fd < 0) {
+        return -1;
     }
-
-    int ss_fd = socket(AF_INET, SOCK_STREAM, 0);
-    if (ss_fd < 0) {
-        return 0;
+    fchmod(fd, 0600);
+    int rc = dnfs_write_all(fd, content, strlen(content));
+    if (rc == 0) {
+        rc = fsync(fd);
     }
-
-    struct sockaddr_in ss_addr;
-    memset(&ss_addr, 0, sizeof(ss_addr));
-    ss_addr.sin_family = AF_INET;
-    ss_addr.sin_port = htons(port);
-    if (inet_pton(AF_INET, ip, &ss_addr.sin_addr) <= 0) {
-        close(ss_fd);
-        return 0;
+    if (close(fd) != 0) {
+        rc = -1;
     }
-
-    if (connect(ss_fd, (struct sockaddr *)&ss_addr, sizeof(ss_addr)) < 0) {
-        close(ss_fd);
-        return 0;
+    if (rc == 0) {
+        rc = rename(tmp_path, path);
     }
-
-    char stat_req[256];
-    int len = snprintf(stat_req, sizeof(stat_req),
-                       "{\"cmd\":\"STAT\",\"filename\":\"%s\"}\n",
-                       filename);
-    if (len <= 0) {
-        close(ss_fd);
-        return 0;
+    if (rc != 0) {
+        unlink(tmp_path);
     }
-
-    if (send(ss_fd, stat_req, len, 0) < 0) {
-        close(ss_fd);
-        return 0;
-    }
-
-    char stat_resp[512];
-    int total = 0;
-    int done = 0;
-    while (!done && total < (int)sizeof(stat_resp) - 1) {
-        int chunk = recv(ss_fd, stat_resp + total, (int)sizeof(stat_resp) - 1 - total, 0);
-        if (chunk <= 0) {
-            break;
-        }
-        total += chunk;
-        for (int i = total - chunk; i < total; i++) {
-            if (stat_resp[i] == '\n') {
-                done = 1;
-                total = i + 1;
-                break;
-            }
-        }
-    }
-    close(ss_fd);
-
-    if (total <= 0) {
-        return 0;
-    }
-
-    stat_resp[total] = '\0';
-    if (total > 0 && stat_resp[total - 1] == '\n') {
-        stat_resp[total - 1] = '\0';
-    }
-
-    if (!strstr(stat_resp, "\"status\":\"OK\"")) {
-        return 0;
-    }
-
-    if (words) *words = parse_json_int(stat_resp, "words");
-    if (chars) *chars = parse_json_int(stat_resp, "chars");
-    if (bytes) *bytes = parse_json_int(stat_resp, "bytes");
-    return 1;
+    return rc;
 }
 
+/* save_mutex keeps whole saves in order: the newest snapshot of the tables
+ * is always the one written last. */
 void save_metadata(void) {
-    FILE *fp = fopen(METADATA_FILE, "w");
-    if (!fp) {
+    pthread_mutex_lock(&save_mutex);
+
+    StrBuf sb;
+    sb_init(&sb);
+    sb_append(&sb, "{\n  \"version\": 2,\n  \"users\": [");
+
+    pthread_mutex_lock(&files_mutex);
+    pthread_mutex_lock(&users_mutex);
+    for (int i = 0; i < user_count; i++) {
+        sb_append(&sb, i ? ",\n    {\"name\":" : "\n    {\"name\":");
+        sb_append_json(&sb, users[i].username);
+        sb_append(&sb, ",\"pass\":");
+        sb_append_json(&sb, users[i].pass_hash);
+        sb_append(&sb, "}");
+    }
+    pthread_mutex_unlock(&users_mutex);
+
+    sb_append(&sb, "\n  ],\n  \"files\": {");
+    int first = 1;
+    for (int i = 0; i < HASH_BUCKETS; i++) {
+        for (HashNode *node = file_hash_table[i]; node; node = node->next) {
+            FileMetadata *file = node->file;
+            if (file->pending) {
+                continue;
+            }
+            sb_append(&sb, first ? "\n    " : ",\n    ");
+            first = 0;
+            sb_append_json(&sb, file->filename);
+            sb_append(&sb, ": {\"owner\":");
+            sb_append_json(&sb, file->owner);
+            sb_append(&sb, ",\"ss_ip\":");
+            sb_append_json(&sb, file->ss_ip);
+            sb_appendf(&sb, ",\"ss_port\":%d,\"backup_ss_ip\":", file->ss_port);
+            sb_append_json(&sb, file->backup_ss_ip);
+            sb_appendf(&sb, ",\"backup_ss_port\":%d,\"primary_stale\":%d,\"backup_stale\":%d"
+                            ",\"created_at\":%ld,\"last_modified\":%ld,\"last_accessed\":%ld,\"last_accessed_by\":",
+                       file->backup_ss_port, file->primary_stale, file->backup_stale,
+                       (long)file->created_at, (long)file->last_modified, (long)file->last_accessed);
+            sb_append_json(&sb, file->last_accessed_by);
+            sb_appendf(&sb, ",\"words\":%d,\"chars\":%d,\"bytes\":%d,\"access\":[",
+                       file->words, file->chars, file->bytes);
+            for (AccessEntry *entry = file->access_list; entry; entry = entry->next) {
+                sb_append(&sb, entry == file->access_list ? "{\"user\":" : ",{\"user\":");
+                sb_append_json(&sb, entry->username);
+                sb_append(&sb, ",\"mode\":");
+                sb_append_json(&sb, entry->mode);
+                sb_append(&sb, "}");
+            }
+            sb_append(&sb, "]}");
+        }
+    }
+    pthread_mutex_unlock(&files_mutex);
+
+    sb_append(&sb, "\n  }\n}\n");
+    char *text = sb_take(&sb);
+    if (!text || write_file_atomic(METADATA_FILE, text) != 0) {
+        log_message("ERROR", "Failed to save metadata", "-", 0, "system");
+    }
+    free(text);
+
+    pthread_mutex_unlock(&save_mutex);
+}
+
+static char *dup_range(const char *start, const char *end) {
+    size_t len = (size_t)(end - start);
+    char *out = malloc(len + 1);
+    if (out) {
+        memcpy(out, start, len);
+        out[len] = '\0';
+    }
+    return out;
+}
+
+/* Times are epoch seconds; version 1 files stored local-time strings. */
+static time_t parse_time(const char *json, const char *key, time_t fallback) {
+    long epoch = 0;
+    if (json_get_long(json, key, &epoch)) {
+        return (time_t)epoch;
+    }
+    char text[64];
+    if (json_get_str(json, key, text, sizeof(text)) && text[0]) {
+        struct tm tm;
+        memset(&tm, 0, sizeof(tm));
+        if (strptime(text, "%Y-%m-%d %H:%M:%S", &tm)) {
+            tm.tm_isdst = -1;
+            return mktime(&tm);
+        }
+    }
+    return fallback;
+}
+
+static void load_user(const char *start, const char *end) {
+    char name[MAX_USERNAME] = {0};
+    char pass[PASS_HASH_LEN] = {0};
+
+    if (*start == '"') {
+        char *legacy = json_read_string(start, NULL);
+        if (legacy && strlen(legacy) < sizeof(name)) {
+            strcpy(name, legacy);
+        }
+        free(legacy);
+    } else {
+        char *obj = dup_range(start, end);
+        if (obj) {
+            json_get_str(obj, "name", name, sizeof(name));
+            json_get_str(obj, "pass", pass, sizeof(pass));
+        }
+        free(obj);
+    }
+
+    if (!dnfs_valid_username(name) || user_count >= MAX_USERS || user_index(name) >= 0) {
         return;
     }
-
-    fprintf(fp, "{\n  \"users\": [");
-
-    int first = 1;
-    for (int i = 0; i < client_count; i++) {
-        if (!first) {
-            fprintf(fp, ",");
-        }
-        first = 0;
-        fprintf(fp, "\"%s\"", clients[i].username);
-    }
-
-    fprintf(fp, "],\n  \"files\": {\n");
-
-    first = 1;
-    for (int i = 0; i < MAX_FILES; i++) {
-        HashNode *node = file_hash_table[i];
-        while (node) {
-            FileMetadata *file = node->file;
-            if (file->active) {
-                if (!first) {
-                    fprintf(fp, ",\n");
-                }
-                first = 0;
-
-                char created_str[64];
-                char modified_str[64];
-                char accessed_str[64];
-
-                struct tm *tm_info = localtime(&file->created_at);
-                strftime(created_str, sizeof(created_str), "%Y-%m-%d %H:%M:%S", tm_info);
-
-                tm_info = localtime(&file->last_modified);
-                strftime(modified_str, sizeof(modified_str), "%Y-%m-%d %H:%M:%S", tm_info);
-
-                tm_info = localtime(&file->last_accessed);
-                strftime(accessed_str, sizeof(accessed_str), "%Y-%m-%d %H:%M:%S", tm_info);
-
-                fprintf(fp, "    \"%s\": {\"owner\": \"%s\", \"ss_ip\": \"%s\", \"ss_port\": %d, \"backup_ss_ip\": \"%s\", \"backup_ss_port\": %d, \"created_at\": \"%s\", \"last_modified\": \"%s\", \"last_accessed\": \"%s\", \"last_accessed_by\": \"%s\", \"words\": %d, \"chars\": %d, \"bytes\": %d, \"access\": [",
-                        file->filename, file->owner, file->ss_ip, file->ss_port, file->backup_ss_ip, file->backup_ss_port,
-                        created_str, modified_str, accessed_str, file->last_accessed_by, file->words, file->chars, file->bytes);
-
-                AccessEntry *entry = file->access_list;
-                int first_access = 1;
-                while (entry) {
-                    if (!first_access) {
-                        fprintf(fp, ", ");
-                    }
-                    first_access = 0;
-                    fprintf(fp, "{\"user\": \"%s\", \"mode\": \"%s\"}", entry->username, entry->mode);
-                    entry = entry->next;
-                }
-
-                fprintf(fp, "]}");
-            }
-            node = node->next;
-        }
-    }
-
-    fprintf(fp, "\n  }\n}\n");
-    fclose(fp);
+    strcpy(users[user_count].username, name);
+    strcpy(users[user_count].pass_hash, pass);
+    user_count++;
 }
 
+static AccessEntry *load_access_list(const char *entry) {
+    AccessEntry *head = NULL;
+    AccessEntry **tail = &head;
+
+    const char *p = json_find_value(entry, "access");
+    if (!p || *p != '[') {
+        return NULL;
+    }
+    p++;
+    for (;;) {
+        p = json_skip_ws(p);
+        if (*p != '{') {
+            break;
+        }
+        const char *end = json_skip_value(p);
+        if (!end) {
+            break;
+        }
+        char *obj = dup_range(p, end);
+        AccessEntry *new_entry = calloc(1, sizeof(AccessEntry));
+        if (obj && new_entry &&
+            json_get_str(obj, "user", new_entry->username, sizeof(new_entry->username)) &&
+            dnfs_valid_username(new_entry->username)) {
+            if (!json_get_str(obj, "mode", new_entry->mode, sizeof(new_entry->mode)) ||
+                (strcmp(new_entry->mode, "R") != 0 && strcmp(new_entry->mode, "W") != 0)) {
+                strcpy(new_entry->mode, "R");
+            }
+            *tail = new_entry;
+            tail = &new_entry->next;
+        } else {
+            free(new_entry);
+        }
+        free(obj);
+
+        p = json_skip_ws(end);
+        if (*p == ',') {
+            p++;
+        }
+    }
+    return head;
+}
+
+static void load_file_entry(const char *filename, const char *entry) {
+    if (!dnfs_valid_filename(filename) || find_any_file(filename)) {
+        return;
+    }
+    FileMetadata *file = calloc(1, sizeof(FileMetadata));
+    if (!file) {
+        return;
+    }
+    strcpy(file->filename, filename);
+    parse_json_string(entry, "owner", file->owner, sizeof(file->owner));
+    parse_json_string(entry, "ss_ip", file->ss_ip, sizeof(file->ss_ip));
+    file->ss_port = parse_json_int(entry, "ss_port");
+    parse_json_string(entry, "backup_ss_ip", file->backup_ss_ip, sizeof(file->backup_ss_ip));
+    file->backup_ss_port = parse_json_int(entry, "backup_ss_port");
+    file->primary_stale = parse_json_int(entry, "primary_stale");
+    file->backup_stale = parse_json_int(entry, "backup_stale");
+    file->created_at = parse_time(entry, "created_at", time(NULL));
+    file->last_modified = parse_time(entry, "last_modified", file->created_at);
+    file->last_accessed = parse_time(entry, "last_accessed", file->created_at);
+    parse_json_string(entry, "last_accessed_by", file->last_accessed_by, sizeof(file->last_accessed_by));
+    if (!file->last_accessed_by[0]) {
+        strcpy(file->last_accessed_by, file->owner);
+    }
+    file->words = parse_json_int(entry, "words");
+    file->chars = parse_json_int(entry, "chars");
+    file->bytes = parse_json_int(entry, "bytes");
+    file->access_list = load_access_list(entry);
+    insert_file(file);
+}
+
+/* Each array element and file entry is copied out whole, however large,
+ * so long access lists survive a restart. */
 void load_metadata(void) {
     FILE *fp = fopen(METADATA_FILE, "r");
     if (!fp) {
         return;
     }
-
     if (fseek(fp, 0, SEEK_END) != 0) {
         fclose(fp);
         return;
@@ -336,234 +386,65 @@ void load_metadata(void) {
         fclose(fp);
         return;
     }
-
     size_t read_bytes = fread(json, 1, (size_t)size, fp);
     fclose(fp);
     json[read_bytes] = '\0';
 
-    const char *users_section = strstr(json, "\"users\"");
-    if (users_section) {
-        const char *array_start = strchr(users_section, '[');
-        if (array_start) {
-            const char *cursor = array_start + 1;
-            client_count = 0;
-
-            while (*cursor && client_count < MAX_CLIENTS) {
-                while (*cursor && (isspace((unsigned char)*cursor) || *cursor == ',')) {
-                    cursor++;
-                }
-                if (*cursor == ']' || *cursor == '\0') {
-                    break;
-                }
-                if (*cursor == '"') {
-                    cursor++;
-                    const char *name_end = strchr(cursor, '"');
-                    if (name_end) {
-                        size_t name_len = (size_t)(name_end - cursor);
-                        if (name_len >= MAX_USERNAME) {
-                            name_len = MAX_USERNAME - 1;
-                        }
-                        memcpy(clients[client_count].username, cursor, name_len);
-                        clients[client_count].username[name_len] = '\0';
-                        clients[client_count].active = 0;
-                        client_count++;
-                        cursor = name_end + 1;
-                    } else {
-                        break;
-                    }
-                } else {
-                    cursor++;
-                }
+    const char *p = json_find_value(json, "users");
+    if (p && *p == '[') {
+        p++;
+        for (;;) {
+            p = json_skip_ws(p);
+            if (*p != '"' && *p != '{') {
+                break;
+            }
+            const char *end = json_skip_value(p);
+            if (!end) {
+                break;
+            }
+            load_user(p, end);
+            p = json_skip_ws(end);
+            if (*p == ',') {
+                p++;
             }
         }
     }
 
-    const char *files_section = strstr(json, "\"files\"");
-    if (files_section) {
-        const char *cursor = strchr(files_section, '{');
-        if (cursor) {
-            cursor++;
-            while (*cursor) {
-                while (*cursor && (isspace((unsigned char)*cursor) || *cursor == ',')) {
-                    cursor++;
+    p = json_find_value(json, "files");
+    if (p && *p == '{') {
+        p++;
+        for (;;) {
+            p = json_skip_ws(p);
+            if (*p != '"') {
+                break;
+            }
+            const char *after_key = NULL;
+            char *filename = json_read_string(p, &after_key);
+            if (!filename) {
+                break;
+            }
+            p = json_skip_ws(after_key);
+            if (*p != ':') {
+                free(filename);
+                break;
+            }
+            p = json_skip_ws(p + 1);
+            const char *end = json_skip_value(p);
+            if (!end) {
+                free(filename);
+                break;
+            }
+            if (*p == '{') {
+                char *entry = dup_range(p, end);
+                if (entry) {
+                    load_file_entry(filename, entry);
                 }
-                if (*cursor == '}' || *cursor == '\0') {
-                    break;
-                }
-                if (*cursor != '"') {
-                    cursor++;
-                    continue;
-                }
-                cursor++;
-                const char *fname_end = strchr(cursor, '"');
-                if (!fname_end) {
-                    break;
-                }
-                char filename[MAX_FILENAME];
-                size_t fname_len = (size_t)(fname_end - cursor);
-                if (fname_len >= sizeof(filename)) {
-                    fname_len = sizeof(filename) - 1;
-                }
-                memcpy(filename, cursor, fname_len);
-                filename[fname_len] = '\0';
-
-                const char *entry_start = strchr(fname_end, '{');
-                if (!entry_start) {
-                    break;
-                }
-                entry_start++;
-                int brace_depth = 1;
-                const char *entry_end = entry_start;
-                while (*entry_end && brace_depth > 0) {
-                    if (*entry_end == '{') {
-                        brace_depth++;
-                    } else if (*entry_end == '}') {
-                        brace_depth--;
-                    }
-                    entry_end++;
-                }
-                if (brace_depth != 0) {
-                    break;
-                }
-                size_t entry_len = (size_t)((entry_end - 1) - entry_start);
-                if (entry_len >= 1024) {
-                    entry_len = 1023;
-                }
-                char entry_buf[1024];
-                memcpy(entry_buf, entry_start, entry_len);
-                entry_buf[entry_len] = '\0';
-
-                FileMetadata *file = malloc(sizeof(FileMetadata));
-                if (!file) {
-                    break;
-                }
-                memset(file, 0, sizeof(*file));
-                strncpy(file->filename, filename, sizeof(file->filename) - 1);
-                file->filename[sizeof(file->filename) - 1] = '\0';
-                parse_json_string(entry_buf, "owner", file->owner, sizeof(file->owner));
-                parse_json_string(entry_buf, "ss_ip", file->ss_ip, sizeof(file->ss_ip));
-                file->ss_port = parse_json_int(entry_buf, "ss_port");
-                parse_json_string(entry_buf, "backup_ss_ip", file->backup_ss_ip, sizeof(file->backup_ss_ip));
-                file->backup_ss_port = parse_json_int(entry_buf, "backup_ss_port");
-                file->active = 1;
-
-                char created_str[64] = {0};
-                char modified_str[64] = {0};
-                char accessed_str[64] = {0};
-                char accessed_by[MAX_USERNAME] = {0};
-
-                parse_json_string(entry_buf, "created_at", created_str, sizeof(created_str));
-                parse_json_string(entry_buf, "last_modified", modified_str, sizeof(modified_str));
-                parse_json_string(entry_buf, "last_accessed", accessed_str, sizeof(accessed_str));
-                parse_json_string(entry_buf, "last_accessed_by", accessed_by, sizeof(accessed_by));
-
-                if (strlen(created_str) > 0) {
-                    struct tm tm = {0};
-                    strptime(created_str, "%Y-%m-%d %H:%M:%S", &tm);
-                    file->created_at = mktime(&tm);
-                } else {
-                    file->created_at = time(NULL);
-                }
-
-                if (strlen(modified_str) > 0) {
-                    struct tm tm = {0};
-                    strptime(modified_str, "%Y-%m-%d %H:%M:%S", &tm);
-                    file->last_modified = mktime(&tm);
-                } else {
-                    file->last_modified = file->created_at;
-                }
-
-                if (strlen(accessed_str) > 0) {
-                    struct tm tm = {0};
-                    strptime(accessed_str, "%Y-%m-%d %H:%M:%S", &tm);
-                    file->last_accessed = mktime(&tm);
-                } else {
-                    file->last_accessed = file->created_at;
-                }
-
-                if (strlen(accessed_by) > 0) {
-                    strncpy(file->last_accessed_by, accessed_by, sizeof(file->last_accessed_by) - 1);
-                    file->last_accessed_by[sizeof(file->last_accessed_by) - 1] = '\0';
-                } else {
-                    strncpy(file->last_accessed_by, file->owner, sizeof(file->last_accessed_by) - 1);
-                    file->last_accessed_by[sizeof(file->last_accessed_by) - 1] = '\0';
-                }
-
-                file->words = parse_json_int(entry_buf, "words");
-                file->chars = parse_json_int(entry_buf, "chars");
-                file->bytes = parse_json_int(entry_buf, "bytes");
-                file->access_list = NULL;
-
-                AccessEntry *head = NULL;
-                AccessEntry **tail = &head;
-
-                const char *access_pos = strstr(entry_buf, "\"access\"");
-                if (access_pos) {
-                    const char *array_start = strchr(access_pos, '[');
-                    if (array_start) {
-                        array_start++;
-                        while (*array_start) {
-                            while (*array_start && (isspace((unsigned char)*array_start) || *array_start == ',')) {
-                                array_start++;
-                            }
-                            if (*array_start == ']' || *array_start == '\0') {
-                                break;
-                            }
-                            if (*array_start != '{') {
-                                array_start++;
-                                continue;
-                            }
-
-                            array_start++;
-                            int obj_depth = 1;
-                            const char *obj_cursor = array_start;
-                            while (*obj_cursor && obj_depth > 0) {
-                                if (*obj_cursor == '{') {
-                                    obj_depth++;
-                                } else if (*obj_cursor == '}') {
-                                    obj_depth--;
-                                }
-                                obj_cursor++;
-                            }
-                            if (obj_depth != 0) {
-                                break;
-                            }
-
-                            size_t obj_len = (size_t)((obj_cursor - 1) - array_start);
-                            if (obj_len >= 256) {
-                                obj_len = 255;
-                            }
-                            char access_obj[256];
-                            memcpy(access_obj, array_start, obj_len);
-                            access_obj[obj_len] = '\0';
-
-                            AccessEntry *new_entry = malloc(sizeof(AccessEntry));
-                            if (!new_entry) {
-                                break;
-                            }
-                            memset(new_entry, 0, sizeof(*new_entry));
-                            parse_json_string(access_obj, "user", new_entry->username, sizeof(new_entry->username));
-                            parse_json_string(access_obj, "mode", new_entry->mode, sizeof(new_entry->mode));
-                            if (new_entry->username[0] == '\0') {
-                                free(new_entry);
-                                array_start = obj_cursor;
-                                continue;
-                            }
-                            if (new_entry->mode[0] == '\0') {
-                                strcpy(new_entry->mode, "R");
-                            }
-                            new_entry->next = NULL;
-                            *tail = new_entry;
-                            tail = &new_entry->next;
-
-                            array_start = obj_cursor;
-                        }
-                    }
-                }
-
-                file->access_list = head;
-                insert_file(file);
-                cursor = entry_end;
+                free(entry);
+            }
+            free(filename);
+            p = json_skip_ws(end);
+            if (*p == ',') {
+                p++;
             }
         }
     }

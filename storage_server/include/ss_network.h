@@ -4,7 +4,8 @@
 #include "ss_common.h"
 
 // Network operations
-void register_with_nm(void);
+void *heartbeat_thread(void *arg);
+void notify_nm_commit(const char *filename);
 void handle_client(int client_sock);
 void *client_thread(void *arg);
 

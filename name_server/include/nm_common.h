@@ -1,10 +1,6 @@
 #ifndef NM_COMMON_H
 #define NM_COMMON_H
 
-#ifndef _XOPEN_SOURCE
-#define _XOPEN_SOURCE
-#endif
-
 #include <arpa/inet.h>
 #include <ctype.h>
 #include <errno.h>
@@ -21,15 +17,18 @@
 #include <time.h>
 #include <unistd.h>
 
-#define NM_PORT 9000
-#define MAX_CLIENTS 100
-#define MAX_STORAGE_SERVERS 10
-#define MAX_FILES 1000
-#define MAX_USERS 100
-#define BUFFER_SIZE 8192
+#include "dnfs_shared.h"
+
+#define MAX_USERS 1024
+#define MAX_SESSIONS 1024
+#define MAX_STORAGE_SERVERS 32
+#define HASH_BUCKETS 1024
 #define MAX_FILENAME 256
 #define MAX_USERNAME 64
+#define PASS_HASH_LEN 160
+#define SECRET_LEN 128
 #define CACHE_SIZE 50
+#define MAX_CONNECTION_THREADS 256
 
 /* Forward declarations */
 typedef struct FileMetadata FileMetadata;
@@ -51,21 +50,22 @@ typedef struct {
 
 typedef struct {
     char username[MAX_USERNAME];
-    int socket_fd;
+    char pass_hash[PASS_HASH_LEN];
     char ip[INET_ADDRSTRLEN];
-    int active;
-    time_t connected_at;
-} Client;
+    time_t last_login;
+} User;
+
+typedef struct {
+    char token[DNFS_HEX_LEN + 1];
+    char username[MAX_USERNAME];
+    time_t last_used;
+} Session;
 
 typedef struct {
     char ip[INET_ADDRSTRLEN];
-    int nm_port;
     int client_port;
-    int socket_fd;
-    int active;
-    char **files;
-    int file_count;
-    time_t connected_at;
+    time_t registered_at;
+    time_t last_seen;
 } StorageServer;
 
 typedef struct AccessEntry {
@@ -74,6 +74,8 @@ typedef struct AccessEntry {
     struct AccessEntry *next;
 } AccessEntry;
 
+/* A replica is "stale" when it missed a commit (its server was down or
+ * lost the file); it is refreshed from the other replica when possible. */
 struct FileMetadata {
     char filename[MAX_FILENAME];
     char owner[MAX_USERNAME];
@@ -81,8 +83,10 @@ struct FileMetadata {
     int ss_port;
     char backup_ss_ip[INET_ADDRSTRLEN];
     int backup_ss_port;
+    int primary_stale;
+    int backup_stale;
+    int pending;
     AccessEntry *access_list;
-    int active;
     time_t created_at;
     time_t last_modified;
     time_t last_accessed;
@@ -98,19 +102,27 @@ typedef struct HashNode {
     struct HashNode *next;
 } HashNode;
 
-extern char BASE_DIR[1024];
+extern char BASE_DIR[256];
 extern char LOG_DIR[1024];
 extern char METADATA_FILE[1024];
+extern char NM_SECRET[SECRET_LEN];
+extern int ss_timeout_sec;
 
-extern Client clients[MAX_CLIENTS];
+extern User users[MAX_USERS];
+extern int user_count;
+extern Session sessions[MAX_SESSIONS];
 extern StorageServer storage_servers[MAX_STORAGE_SERVERS];
-extern HashNode *file_hash_table[MAX_FILES];
-extern LRUCache file_cache;
-extern int client_count;
 extern int ss_count;
-extern pthread_mutex_t clients_mutex;
+extern HashNode *file_hash_table[HASH_BUCKETS];
+extern LRUCache file_cache;
+
+/* Lock order: save_mutex -> files_mutex -> users_mutex. ss_mutex and
+ * replication_mutex are never held together with another of these. */
+extern pthread_mutex_t users_mutex;
 extern pthread_mutex_t ss_mutex;
 extern pthread_mutex_t files_mutex;
+extern pthread_mutex_t save_mutex;
+extern pthread_mutex_t replication_mutex;
 extern FILE *log_file;
 extern pthread_mutex_t log_mutex;
 

@@ -29,6 +29,7 @@ void session_reset(WriteSession *session);
 
 // String array utilities
 void free_string_array(char **arr, int count);
+int append_sentence(char ***arr, int *count, int *capacity, const char *src);
 int split_into_sentences(const char *content, char ***out_sentences, int *out_count);
 int split_sentence_into_words(const char *sentence, char ***out_words, int *out_count, 
                                int *out_capacity, char *punctuation);

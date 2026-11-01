@@ -31,7 +31,7 @@ void free_string_array(char **arr, int count) {
     free(arr);
 }
 
-static int append_sentence(char ***arr, int *count, int *capacity, const char *src) {
+int append_sentence(char ***arr, int *count, int *capacity, const char *src) {
     if (!arr || !count || !capacity) return 0;
     if (*count >= *capacity) {
         int new_capacity = (*capacity == 0) ? 4 : (*capacity * 2);
