@@ -6,14 +6,19 @@
 
 extern __thread ClientLogContext g_log_ctx;
 
-void send_json(int client, const char* json) {
-    char msg[MAX_MSG];
-    int n = snprintf(msg, sizeof(msg), "%s\n", json);
-    if (n > 0) {
-        ssize_t w = write(client, msg, n);
-        (void)w;
-    }
-    log_event("RESPONSE", g_log_ctx.ip, g_log_ctx.port, g_log_ctx.username, g_log_ctx.cmd, json);
+// Sends one newline-terminated JSON message. Only the first 200 characters
+// go to the log, so reading a large file doesn't copy it into the log.
+// Returns -1 if the client is gone.
+static int send_json_checked(int client, const char *json) {
+    int rc = dnfs_send_line(client, json);
+    char preview[201];
+    snprintf(preview, sizeof(preview), "%.200s", json);
+    log_event("RESPONSE", g_log_ctx.ip, g_log_ctx.port, g_log_ctx.username, g_log_ctx.cmd, preview);
+    return rc;
+}
+
+void send_json(int client, const char *json) {
+    send_json_checked(client, json);
 }
 
 void send_error(int client, const char *reason) {
@@ -32,71 +37,60 @@ void send_ok_message(int client, const char *msg) {
     }
 }
 
-void send_plain_line(int client, const char *line, size_t len) {
-    if (!line) return;
-    if (len == (size_t)-1) {
-        len = strlen(line);
-    }
-    if (len > 0) {
-        write(client, line, len);
-        char preview[128];
-        size_t copy_len = len < (sizeof(preview) - 1) ? len : (sizeof(preview) - 1);
-        memcpy(preview, line, copy_len);
-        preview[copy_len] = '\0';
-        log_event("RESPONSE", g_log_ctx.ip, g_log_ctx.port, g_log_ctx.username, g_log_ctx.cmd, preview);
-    } else {
-        log_event("RESPONSE", g_log_ctx.ip, g_log_ctx.port, g_log_ctx.username, g_log_ctx.cmd, "");
-    }
-    write(client, "", 1);
-}
-
 void handle_create_file(int client, const char *filename, const char *initial_content) {
-    if (!filename || !*filename) {
-        send_error(client, "BAD_REQUEST");
-        return;
-    }
-
     char path[1024];
-    build_filepath(path, filename);
+    build_filepath(path, sizeof(path), filename);
 
+    file_lock(filename);
     if (file_exists(path)) {
+        file_unlock(filename);
         send_error(client, "ALREADY_EXISTS");
         return;
     }
+    int rc = save_file_atomic(filename, initial_content ? initial_content : "");
+    file_unlock(filename);
 
-    const char *content = initial_content ? initial_content : "";
-    if (save_file_atomic(filename, content) != 0) {
+    if (rc != 0) {
         send_error(client, "UNKNOWN");
         return;
     }
-
     send_ok_message(client, "CREATED");
 }
 
-void handle_read(int client, const char *filename) {
+// The reply is sized to the file, so there is no length limit.
+// with_snapshot is used by the name server when copying a file to its backup.
+void handle_read(int client, const char *filename, int with_snapshot) {
     char *content = load_file(filename);
     if (!content) {
         send_error(client, "FILE_NOT_FOUND");
         return;
     }
+    char *snapshot = with_snapshot ? load_snapshot(filename) : NULL;
 
-    char *escaped = json_escape(content);
-    if (!escaped) {
-        free(content);
+    StrBuf sb;
+    sb_init(&sb);
+    sb_append(&sb, "{ \"status\":\"OK\", \"content\":");
+    sb_append_json(&sb, content);
+    if (snapshot) {
+        sb_append(&sb, ", \"snapshot\":");
+        sb_append_json(&sb, snapshot);
+    }
+    sb_append(&sb, " }");
+    free(content);
+    free(snapshot);
+
+    char *response = sb_take(&sb);
+    if (!response) {
         send_error(client, "UNKNOWN");
         return;
     }
-
-    char response[MAX_MSG];
-    snprintf(response, sizeof(response),
-             "{ \"status\":\"OK\", \"content\":\"%s\" }",
-             escaped);
-
     send_json(client, response);
-    free(escaped);
-    free(content);
+    free(response);
 }
 
+// Each word is its own JSON message and the end is {"status":"END"}, so a
+// word like "STOP" or "{" in the file can't be mistaken for a control
+// message. Stops as soon as the client goes away.
 void handle_stream(int client, const char *filename) {
     char *content = load_file(filename);
     if (!content) {
@@ -114,14 +108,25 @@ void handle_stream(int client, const char *filename) {
         while (*p && !isspace((unsigned char)*p)) {
             p++;
         }
-        size_t len = (size_t)(p - start);
-        if (len > 0) {
-            send_plain_line(client, start, len);
-            usleep(100000);
+
+        char *word = strndup(start, (size_t)(p - start));
+        StrBuf sb;
+        sb_init(&sb);
+        sb_append(&sb, "{ \"status\":\"OK\", \"word\":");
+        sb_append_json(&sb, word);
+        sb_append(&sb, " }");
+        free(word);
+        char *msg = sb_take(&sb);
+        int rc = msg ? send_json_checked(client, msg) : -1;
+        free(msg);
+        if (rc != 0) {
+            free(content);
+            return;
         }
+        usleep(100000);
     }
 
-    send_plain_line(client, "STOP", 4);
+    send_json(client, "{ \"status\":\"END\" }");
     free(content);
 }
 
@@ -163,49 +168,77 @@ void handle_stat(int client, const char *filename) {
     send_json(client, response);
 }
 
-void handle_undo(int client, const char *filename) {
+// Single-level undo: restores the version saved just before the last
+// change, then discards that snapshot.
+int handle_undo(int client, const char *filename) {
+    file_lock(filename);
     if (file_has_active_lock(filename)) {
+        file_unlock(filename);
+        send_error(client, "LOCKED");
+        return 0;
+    }
+
+    char *snapshot = load_snapshot(filename);
+    if (!snapshot) {
+        file_unlock(filename);
+        send_error(client, "NO_SNAPSHOT");
+        return 0;
+    }
+
+    int rc = save_file_atomic(filename, snapshot);
+    if (rc == 0) {
+        remove_snapshot(filename);
+    }
+    file_unlock(filename);
+    free(snapshot);
+
+    if (rc != 0) {
+        send_error(client, "UNKNOWN");
+        return 0;
+    }
+    send_ok_message(client, NULL);
+    return 1;
+}
+
+// Replaces a file with a copy from the other replica (name server only).
+void handle_put(int client, const char *filename, const char *content, const char *snapshot) {
+    file_lock(filename);
+    int rc = save_file_atomic(filename, content);
+    if (rc == 0) {
+        if (snapshot) {
+            rc = save_snapshot(filename, snapshot);
+        } else {
+            remove_snapshot(filename);
+        }
+    }
+    file_unlock(filename);
+
+    if (rc != 0) {
+        send_error(client, "UNKNOWN");
+        return;
+    }
+    send_ok_message(client, "STORED");
+}
+
+void handle_delete(int client, const char *filename) {
+    file_lock(filename);
+    if (file_has_active_lock(filename)) {
+        file_unlock(filename);
         send_error(client, "LOCKED");
         return;
     }
 
     char path[1024];
-    build_snapshot_path(path, filename);
-    FILE *f = fopen(path, "r");
-    if (!f) {
-        send_error(client, "NO_SNAPSHOT");
-        return;
+    build_filepath(path, sizeof(path), filename);
+    int rc = remove(path);
+    if (rc == 0) {
+        remove_snapshot(filename);
     }
+    file_unlock(filename);
 
-    if (fseek(f, 0, SEEK_END) != 0) {
-        fclose(f);
-        send_error(client, "UNKNOWN");
+    if (rc != 0) {
+        send_error(client, "FILE_NOT_FOUND");
         return;
     }
-    long size = ftell(f);
-    if (size < 0) {
-        fclose(f);
-        send_error(client, "UNKNOWN");
-        return;
-    }
-    rewind(f);
-
-    char *content = malloc((size_t)size + 1);
-    if (!content) {
-        fclose(f);
-        send_error(client, "UNKNOWN");
-        return;
-    }
-    size_t read = fread(content, 1, (size_t)size, f);
-    fclose(f);
-    content[read] = '\0';
-
-    if (save_file_atomic(filename, content) != 0) {
-        free(content);
-        send_error(client, "UNKNOWN");
-        return;
-    }
-
-    free(content);
     send_ok_message(client, NULL);
 }

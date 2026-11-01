@@ -1,220 +1,145 @@
 # Message Formats (JSON over TCP)
 
-Every message is a single JSON object sent per write() call.
+Every message is one JSON object on one line, ending with `\n`. Strings are
+JSON-escaped, so a message never contains a raw newline. A receiver reads
+until `\n`, however many TCP reads that takes.
 
-All responses contain at least:
-{ "status": "OK" } or { "status": "ERR", "reason": "<description>" }
+Every reply has a status:
+{ "status": "OK", ... } or { "status": "ERR", "reason": "<CODE>" }
+
+Filenames and usernames: 1–255 (files) or 1–63 (users) characters from
+`A–Z a–z 0–9 . _ -`, not starting with `.`.
 
 ---
 
 ## Client → Name Server
 
-### Register Client
-{
-  "cmd": "register_client",
-  "username": "alice"
-}
+### Log in
+{ "cmd": "register_client", "username": "alice", "password": "..." }
+
+→ { "status": "OK", "token": "<64 hex>" }
+
+The first login for a username sets its password. Errors: `BAD_CREDENTIALS`,
+`INVALID_USERNAME`, `PASSWORD_REQUIRED`.
+
+### Every other command carries the token
+The name server takes the user's identity from the token. Any `username`
+field is ignored. A missing or unknown token gives `UNAUTHENTICATED` (the
+client then logs in again and retries once).
+
+{ "cmd": "VIEW", "token": "...", "flags": "-al" }
+{ "cmd": "LIST", "token": "..." }
+{ "cmd": "CREATE", "token": "...", "filename": "notes.txt" }
+{ "cmd": "INFO", "token": "...", "filename": "notes.txt" }
+{ "cmd": "DELETE", "token": "...", "filename": "notes.txt" }
+{ "cmd": "EXEC", "token": "...", "filename": "script.sh" }
+{ "cmd": "ADDACCESS", "token": "...", "filename": "notes.txt", "target": "bob", "mode": "W" }
+{ "cmd": "REMACCESS", "token": "...", "filename": "notes.txt", "target": "bob" }
+
+### File operations: the name server returns where to go, plus a ticket
+{ "cmd": "READ" | "WRITE" | "STREAM" | "UNDO", "token": "...", "filename": "notes.txt" }
+
+→ { "status": "OK", "ss_ip": "127.0.0.1", "ss_port": 9100,
+    "user": "alice", "expires": 1793540000, "ticket": "<64 hex>" }
+
+The ticket is HMAC-SHA256(secret, "<cmd>\n<user>\n<filename>\n<expires>") and
+is valid for 5 minutes, for that one command and file.
 
 ---
 
-## Storage Server → Name Server
-
-### Register Storage Server
-{
-  "cmd": "register_ss",
-  "ip": "127.0.0.1",
-  "nm_port": 9000,
-  "client_port": 9100,
-  "files": ["file1.txt", "file2.txt", "dir/file3.txt"]
-}
-
----
-
-## Name Server → Storage Server
-
-### Create File
-{
-  "cmd": "CREATE",
-  "filename": "newfile.txt",
-  "owner": "alice"
-}
-
-### Delete File
-{
-  "cmd": "DELETE",
-  "filename": "oldfile.txt"
-}
-
----
-
-### VIEW (with flags -a, -l, -al)
-{
-  "cmd": "VIEW",
-  "username": "alice",
-  "flags": "-al"
-}
-
-### LIST USERS
-{
-  "cmd": "LIST",
-  "username": "alice"
-}
-
-### CREATE file
-{
-  "cmd": "CREATE",
-  "username": "alice",
-  "filename": "notes.txt"
-}
-
-### INFO about a file
-{
-  "cmd": "INFO",
-  "username": "alice",
-  "filename": "notes.txt"
-}
-
-### ACCESS CONTROL
-{
-  "cmd": "ADDACCESS",
-  "username": "alice",
-  "filename": "notes.txt",
-  "target": "bob",
-  "mode": "W"
-}
-
-{
-  "cmd": "REMACCESS",
-  "username": "alice",
-  "filename": "notes.txt",
-  "target": "bob"
-}
-
-### File operation requests (NM returns SS address)
-{
-  "cmd": "READ",
-  "username": "alice",
-  "filename": "notes.txt"
-}
-
-{
-  "cmd": "WRITE",
-  "username": "alice",
-  "filename": "notes.txt"
-}
-
-{
-  "cmd": "STREAM",
-  "username": "alice",
-  "filename": "notes.txt"
-}
-
-{
-  "cmd": "UNDO",
-  "username": "alice",
-  "filename": "notes.txt"
-}
-
----
-
-## Name Server → Client Responses
+## Name Server → Client replies
 
 ### VIEW (simple)
-{
-  "status": "OK",
-  "files": ["a.txt", "b.txt", "c.txt"]
-}
+{ "status": "OK", "files": ["a.txt", "b.txt"] }
 
-### VIEW (-l details)
-{
-  "status": "OK",
-  "files": [
-    {"filename": "notes.txt", "owner": "alice", "words": 30, "chars": 200}
-  ]
-}
+### VIEW (-l details), sorted by name
+{ "status": "OK", "files": [
+    { "filename": "notes.txt", "owner": "alice", "words": 30, "chars": 200, "bytes": 230,
+      "last_accessed": "2026-11-01 18:40" } ] }
 
-### CREATE or lookup result
-{
-  "status": "OK",
-  "ss_ip": "127.0.0.1",
-  "ss_port": 9100
-}
+### LIST
+{ "status": "OK", "users": ["alice", "bob"] }
 
-### INFO result
-{
-  "status": "OK",
-  "filename": "notes.txt",
-  "owner": "alice",
-  "access": {"alice": "RW", "bob": "R"},
-  "ss_ip": "127.0.0.1",
-  "ss_port": 9100
-}
+### INFO (needs read access)
+{ "status": "OK", "filename": "notes.txt", "owner": "alice",
+  "created_at": "...", "last_modified": "...", "last_accessed": "...", "last_accessed_by": "bob",
+  "words": 30, "chars": 200, "bytes": 230,
+  "access": [ {"user": "alice", "mode": "RW"}, {"user": "bob", "mode": "R"} ],
+  "ss_ip": "127.0.0.1", "ss_port": 9100, "backup_ss_ip": "127.0.0.1", "backup_ss_port": 9101 }
+
+### EXEC
+{ "status": "OK", "output": "...", "exit_code": 0, "timed_out": false, "truncated": false }
 
 ---
 
 ## Client → Storage Server
 
+Every command that names a file carries the ticket fields from the name
+server's reply. Without a valid ticket the reply is `UNAUTHORIZED`.
+
 ### READ
-{
-  "cmd": "READ",
-  "username": "alice",
-  "filename": "notes.txt"
-}
+{ "cmd": "READ", "filename": "notes.txt", "user": "alice", "expires": 1793540000, "ticket": "..." }
+→ { "status": "OK", "content": "full text" }
 
-### WRITE Begin (sentence lock)
-{
-  "cmd": "WRITE",
-  "username": "alice",
-  "filename": "notes.txt",
-  "sentence_index": 0
-}
+### WRITE session (one connection)
+{ "cmd": "WRITE", "filename": "notes.txt", "sentence_index": 0, "user": "...", "expires": ..., "ticket": "..." }
+→ { "status": "OK", "msg": "LOCKED" }
 
-### WRITE Update
-{
-  "cmd": "UPDATE",
-  "word_index": 3,
-  "content": "new wording here"
-}
+{ "cmd": "UPDATE", "word_index": 3, "content": "new wording here" }
+{ "cmd": "UPDATE", "word_index": 3, "content": "replacement", "mode": "replace" }
+→ { "status": "OK", "msg": "UPDATED" }
 
-### WRITE Finish
 { "cmd": "ETIRW" }
+→ { "status": "OK", "msg": "WRITE DONE" } or { "status": "ERR", "reason": "CONFLICT" }
 
 ### STREAM
-{ "cmd": "STREAM", "filename": "notes.txt" }
+{ "cmd": "STREAM", "filename": "notes.txt", "user": ..., "expires": ..., "ticket": ... }
+→ one message per word, about 0.1 s apart:
+{ "status": "OK", "word": "Hello" }
+...
+{ "status": "END" }
 
 ### UNDO
-{ "cmd": "UNDO", "filename": "notes.txt" }
+{ "cmd": "UNDO", "filename": "notes.txt", "user": ..., "expires": ..., "ticket": ... }
+→ { "status": "OK" }   (errors: LOCKED, NO_SNAPSHOT)
 
 ---
 
-## Storage Server → Client Responses
+## Name Server → Storage Server
 
-### READ Response
-{
-  "status": "OK",
-  "content": "full text file content here"
-}
+Signed like client tickets, with user "nm". Only "nm" may use these.
 
-### WRITE Locked OK
-{ "status": "OK", "msg": "LOCKED" }
-
-### WRITE Done
-{ "status": "OK", "msg": "WRITE DONE" }
-
-### STREAM sends one word per line then:
-"STOP"
-
-### UNDO Done
-{ "status": "OK" }
+{ "cmd": "CREATE", "filename": "f", "content": "", "user": "nm", "expires": ..., "ticket": ... }
+{ "cmd": "DELETE", "filename": "f", ... }               errors: LOCKED, FILE_NOT_FOUND
+{ "cmd": "STAT", "filename": "f", ... }                 → { "words", "chars", "bytes" }
+{ "cmd": "READ", "filename": "f", "with_snapshot": true, ... }  → also returns "snapshot"
+{ "cmd": "PUT", "filename": "f", "content": "...", "snapshot": "...", ... }
+  (replaces the file and its undo snapshot; used to copy between replicas)
 
 ---
 
-## Shared Error Responses
-{ "status": "ERR", "reason": "FILE_NOT_FOUND" }
-{ "status": "ERR", "reason": "UNAUTHORIZED" }
-{ "status": "ERR", "reason": "LOCKED" }
-{ "status": "ERR", "reason": "SENTENCE LOCKED" }
-{ "status": "ERR", "reason": "INVALID_INDEX" }
-{ "status": "ERR", "reason": "ALREADY_EXISTS" }
-{ "status": "ERR", "reason": "SS_DOWN" }
-{ "status": "ERR", "reason": "UNKNOWN" }
+## Storage Server → Name Server
+
+Signed with the shared secret: "auth" is HMAC-SHA256(secret,
+"<cmd>\nss:<client_port>\n<filename or empty>\n<expires>").
+
+### Register (on start, and again whenever a heartbeat gets UNKNOWN_SS)
+{ "cmd": "register_ss", "ip": "10.0.0.5", "client_port": 9100, "expires": ..., "auth": "...",
+  "files": ["file1.txt", "file2.txt"] }
+
+### Heartbeat (every DNFS_HEARTBEAT_INTERVAL seconds)
+{ "cmd": "ss_heartbeat", "ip": "10.0.0.5", "client_port": 9100, "expires": ..., "auth": "..." }
+→ { "status": "OK" } or { "status": "ERR", "reason": "UNKNOWN_SS" }
+
+### A file changed (after a commit or undo)
+{ "cmd": "ss_commit", "ip": "10.0.0.5", "client_port": 9100, "filename": "f", "expires": ..., "auth": "..." }
+
+---
+
+## Error codes
+
+FILE_NOT_FOUND, UNAUTHORIZED, UNAUTHENTICATED, BAD_CREDENTIALS, INVALID_FILENAME,
+INVALID_USERNAME, INVALID_FLAGS, BAD_REQUEST, ALREADY_EXISTS, ALREADY_OWNER,
+USER_NOT_FOUND, ACCESS_NOT_FOUND, NO_SS_AVAILABLE, ALL_SS_FAILED, SS_UNAVAILABLE,
+LOCKED, SENTENCE LOCKED, INVALID_INDEX, NO_ACTIVE_WRITE, CONFLICT, NO_SNAPSHOT,
+EMPTY_FILE, EXEC_FAILED, MESSAGE_TOO_LARGE, SERVER_BUSY, UNKNOWN_COMMAND, UNKNOWN

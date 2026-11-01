@@ -3,68 +3,99 @@
 #include "client_commands.h"
 #include "client_network.h"
 
+#include <termios.h>
+
 char NM_IP[INET_ADDRSTRLEN] = "127.0.0.1";
 char current_username[MAX_USERNAME];
+char current_password[MAX_PASSWORD];
+char session_token[DNFS_HEX_LEN + 1];
+
+/* Reads a line without echoing it when stdin is a terminal. */
+static int read_password(char *buf, size_t size) {
+    struct termios old_attr, quiet_attr;
+    int tty = isatty(STDIN_FILENO) && tcgetattr(STDIN_FILENO, &old_attr) == 0;
+    if (tty) {
+        quiet_attr = old_attr;
+        quiet_attr.c_lflag &= ~(tcflag_t)ECHO;
+        tcsetattr(STDIN_FILENO, TCSAFLUSH, &quiet_attr);
+    }
+    char *ok = fgets(buf, (int)size, stdin);
+    if (tty) {
+        tcsetattr(STDIN_FILENO, TCSAFLUSH, &old_attr);
+        printf("\n");
+    }
+    if (!ok) {
+        return 0;
+    }
+    buf[strcspn(buf, "\n")] = '\0';
+    return buf[0] != '\0';
+}
+
+/* Accepts "VIEW", "VIEW -a", "VIEW -l", "VIEW -al" and "VIEW -a -l". */
+static int parse_view_flags(const char *input, char *flags, size_t size) {
+    char copy[1024];
+    snprintf(copy, sizeof(copy), "%s", input);
+    size_t len = 0;
+    char *save = NULL;
+    strtok_r(copy, " \t", &save);
+    for (char *tok = strtok_r(NULL, " \t", &save); tok; tok = strtok_r(NULL, " \t", &save)) {
+        if (tok[0] != '-' || !tok[1]) {
+            return 0;
+        }
+        for (const char *f = tok + 1; *f; f++) {
+            if ((*f != 'a' && *f != 'l') || len + 2 >= size) {
+                return 0;
+            }
+            if (!strchr(flags, *f)) {
+                if (len == 0) {
+                    flags[len++] = '-';
+                }
+                flags[len++] = *f;
+                flags[len] = '\0';
+            }
+        }
+    }
+    return 1;
+}
 
 int main(int argc, char *argv[]) {
     if (argc > 1) {
-        strncpy(NM_IP, argv[1], INET_ADDRSTRLEN - 1);
-        NM_IP[INET_ADDRSTRLEN - 1] = '\0';
-        printf("Connecting to Name Server at %s:%d\n", NM_IP, NM_PORT);
+        snprintf(NM_IP, sizeof(NM_IP), "%s", argv[1]);
+        printf("Connecting to Name Server at %s:%d\n", NM_IP, dnfs_nm_port());
     } else {
         printf("Usage: %s [name_server_ip]\n", argv[0]);
         printf("Using default Name Server IP: %s\n", NM_IP);
     }
 
     printf("Enter username: ");
+    fflush(stdout);
     if (!fgets(current_username, sizeof(current_username), stdin)) {
         fprintf(stderr, "Failed to read username\n");
         return 1;
     }
     current_username[strcspn(current_username, "\n")] = 0;
-    if (strlen(current_username) == 0) {
-        fprintf(stderr, "Username cannot be empty\n");
+    if (!dnfs_valid_username(current_username)) {
+        fprintf(stderr, "Usernames are 1-63 letters, digits, '.', '_' or '-' and can't start with '.'\n");
         return 1;
     }
 
-    int nm_fd = connect_to_nm();
-    if (nm_fd < 0) {
-        fprintf(stderr, "Error: Could not connect to Name Server\n");
+    printf("Password (a new username sets it): ");
+    fflush(stdout);
+    if (!read_password(current_password, sizeof(current_password))) {
+        fprintf(stderr, "Password cannot be empty\n");
         return 1;
     }
 
-    struct sockaddr_in local_addr = {0};
-    socklen_t addr_len = sizeof(local_addr);
-    char client_ip[INET_ADDRSTRLEN] = "127.0.0.1";
-    if (getsockname(nm_fd, (struct sockaddr *)&local_addr, &addr_len) == 0) {
-        inet_ntop(AF_INET, &local_addr.sin_addr, client_ip, INET_ADDRSTRLEN);
-    }
-
-    char register_msg[512];
-    snprintf(register_msg, sizeof(register_msg),
-             "{\"cmd\":\"register_client\",\"username\":\"%s\",\"ip\":\"%s\",\"nm_port\":%d,\"ss_port\":%d}",
-             current_username, client_ip, NM_PORT, NM_PORT + 100);
-
-    send_message(nm_fd, register_msg);
-    char *response = receive_message(nm_fd);
-
-    if (response && strstr(response, "\"status\":\"OK\"")) {
-        printf("Successfully registered as '%s'\n\n", current_username);
-    } else {
-        fprintf(stderr, "Registration failed\n");
-        if (response) free(response);
-        close(nm_fd);
+    if (!login()) {
         return 1;
     }
-
-    if (response) free(response);
-    close(nm_fd);
-
+    printf("Logged in as '%s'\n\n", current_username);
     printf("Type 'help' for available commands\n\n");
 
     char input[1024];
     while (1) {
         printf("%s> ", current_username);
+        fflush(stdout);
         if (!fgets(input, sizeof(input), stdin)) {
             break;
         }
@@ -80,9 +111,12 @@ int main(int argc, char *argv[]) {
         if (strcmp(cmd, "help") == 0) {
             print_help();
         } else if (strcmp(cmd, "VIEW") == 0) {
-            char flags[16] = {0};
-            sscanf(input, "VIEW %15s", flags);
-            handle_view(flags);
+            char flags[8] = {0};
+            if (parse_view_flags(input, flags, sizeof(flags))) {
+                handle_view(flags);
+            } else {
+                printf("Usage: VIEW [-a] [-l] [-al]\n");
+            }
         } else if (strcmp(cmd, "LIST") == 0) {
             handle_list();
         } else if (strcmp(cmd, "CREATE") == 0) {

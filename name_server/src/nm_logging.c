@@ -10,9 +10,9 @@ void log_message(const char *level, const char *message, const char *ip, int por
 
     time_t now = time(NULL);
     char timestamp[64];
-    struct tm *tm_info = localtime(&now);
-    if (tm_info) {
-        strftime(timestamp, sizeof(timestamp), "%Y-%m-%d %H:%M:%S", tm_info);
+    struct tm tm_info;
+    if (localtime_r(&now, &tm_info)) {
+        strftime(timestamp, sizeof(timestamp), "%Y-%m-%d %H:%M:%S", &tm_info);
     } else {
         snprintf(timestamp, sizeof(timestamp), "unknown");
     }

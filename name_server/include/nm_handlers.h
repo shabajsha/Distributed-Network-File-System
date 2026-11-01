@@ -5,6 +5,8 @@
 
 void handle_register_client(int client_fd, const char *request, const char *client_ip);
 void handle_register_ss(int ss_fd, const char *request, const char *ss_ip);
+void handle_ss_heartbeat(int ss_fd, const char *request, const char *ss_ip);
+void handle_ss_commit(int ss_fd, const char *request, const char *ss_ip);
 void handle_view(int client_fd, const char *request, const char *username);
 void handle_list(int client_fd, const char *username);
 void handle_create(int client_fd, const char *request, const char *username);

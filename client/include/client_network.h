@@ -3,9 +3,18 @@
 
 #include "client_common.h"
 
-int connect_to_nm(void);
-int connect_to_ss(const char *ip, int port);
-void send_message(int fd, const char *message);
-char *receive_message(int fd);
+/* One TCP connection plus a buffer for reading newline-terminated replies. */
+typedef struct {
+    int fd;
+    LineReader reader;
+} Conn;
+
+int conn_open(Conn *conn, const char *ip, int port);
+int conn_send(Conn *conn, const char *message);
+char *conn_recv(Conn *conn);
+void conn_close(Conn *conn);
+
+int login(void);
+char *nm_call(const char *cmd, const char *fields);
 
 #endif /* CLIENT_NETWORK_H */

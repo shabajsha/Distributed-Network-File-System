@@ -1,0 +1,19 @@
+# Build outputs
+*.o
+*.d
+/client/client
+/name_server/nm
+/storage_server/ss
+/common/obj/
+
+# Runtime state (created when the servers run)
+/dnfs.secret
+/name_server/logs/
+/name_server/metadata_store.json
+/name_server/metadata_store.json.tmp*
+/storage_server/data/
+/storage_server/snapshots/
+/storage_server/logs/
+
+# Python
+__pycache__/

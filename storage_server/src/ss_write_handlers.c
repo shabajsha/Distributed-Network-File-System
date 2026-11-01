@@ -6,26 +6,6 @@
 
 extern __thread ClientLogContext g_log_ctx;
 
-static int append_sentence(char ***arr, int *count, int *capacity, const char *src) {
-    if (!arr || !count || !capacity) return 0;
-    if (*count >= *capacity) {
-        int new_capacity = (*capacity == 0) ? 4 : (*capacity * 2);
-        char **tmp = (char **)realloc(*arr, sizeof(char *) * new_capacity);
-        if (!tmp) {
-            return 0;
-        }
-        *arr = tmp;
-        *capacity = new_capacity;
-    }
-
-    (*arr)[*count] = strdup(src ? src : "");
-    if (!(*arr)[*count]) {
-        return 0;
-    }
-    (*count)++;
-    return 1;
-}
-
 void handle_write_begin(int client, const char *filename, int sentence_index, 
                         WriteSession *session, const char *username) {
     if (!session) {
@@ -108,7 +88,7 @@ void handle_write_begin(int client, const char *filename, int sentence_index,
             return;
         }
         sentence_count++;
-    } else if (sentence_index > sentence_count || sentence_index >= sentence_count) {
+    } else if (sentence_index > sentence_count) {
         free_string_array(sentences, sentence_count);
         free(content);
         send_error(client, "INVALID_INDEX");
@@ -301,10 +281,20 @@ void handle_update(int client, int word_index, const char *content,
     send_ok_message(client, "UPDATED");
 }
 
-void handle_commit(int client, WriteSession *session) {
+// Commit runs under the file's lock: reload, find the sentence this session
+// started from, splice in the new text, snapshot the version being replaced
+// (for UNDO), and save. Returns 1 if the file changed.
+int handle_commit(int client, WriteSession *session) {
     if (!session || !session->active) {
         send_error(client, "NO_ACTIVE_WRITE");
-        return;
+        return 0;
+    }
+
+    // Nothing was edited: leave the file and its undo snapshot alone.
+    if (!session->dirty) {
+        send_ok_message(client, "WRITE DONE");
+        session_reset(session);
+        return 0;
     }
 
     refresh_trailing_punctuation(session);
@@ -313,7 +303,7 @@ void handle_commit(int client, WriteSession *session) {
     if (!updated_text) {
         send_error(client, "UNKNOWN");
         session_reset(session);
-        return;
+        return 0;
     }
 
     char **replacement = NULL;
@@ -330,29 +320,30 @@ void handle_commit(int client, WriteSession *session) {
             free(updated_text);
             send_error(client, "UNKNOWN");
             session_reset(session);
-            return;
+            return 0;
         }
     }
     free(updated_text);
 
-    char *latest_content = load_file(session->filename);
-    if (!latest_content) {
-        free_string_array(replacement, replacement_count);
-        send_error(client, "FILE_NOT_FOUND");
-        session_reset(session);
-        return;
-    }
-
+    const char *error = NULL;
+    char *latest_content = NULL;
     char **current_sentences = NULL;
     int current_count = 0;
-    if (!split_into_sentences(latest_content, &current_sentences, &current_count)) {
-        free(latest_content);
-        free_string_array(replacement, replacement_count);
-        send_error(client, "UNKNOWN");
-        session_reset(session);
-        return;
+    char **merged = NULL;
+    int merged_count = 0;
+    char *new_content = NULL;
+
+    file_lock(session->filename);
+
+    latest_content = load_file(session->filename);
+    if (!latest_content) {
+        error = "FILE_NOT_FOUND";
+        goto done;
     }
-    free(latest_content);
+    if (!split_into_sentences(latest_content, &current_sentences, &current_count)) {
+        error = "UNKNOWN";
+        goto done;
+    }
 
     int target_index = -1;
     if (session->append_mode) {
@@ -363,103 +354,76 @@ void handle_commit(int client, WriteSession *session) {
             session->original_sentence_index < session->sentence_count) {
             baseline = session->sentences[session->original_sentence_index];
         }
-
         if (baseline && *baseline) {
             target_index = find_sentence_index_with_hint(current_sentences, current_count, 
                                                          baseline, session->original_sentence_index);
         }
-
+        // The sentence was changed by someone else since this WRITE began.
+        // Guessing a position could overwrite a different sentence, so refuse.
         if (target_index < 0) {
-            target_index = session->original_sentence_index;
-        }
-        if (target_index < 0) {
-            target_index = 0;
-        }
-        if (target_index > current_count) {
-            target_index = current_count;
+            error = "CONFLICT";
+            goto done;
         }
     }
 
     int merged_capacity = current_count + replacement_count + 4;
-    char **merged = (char **)malloc(sizeof(char *) * merged_capacity);
+    merged = (char **)malloc(sizeof(char *) * merged_capacity);
     if (!merged) {
-        free_string_array(current_sentences, current_count);
-        free_string_array(replacement, replacement_count);
-        send_error(client, "UNKNOWN");
-        session_reset(session);
-        return;
+        error = "UNKNOWN";
+        goto done;
     }
-    int merged_count = 0;
 
     int copy_limit = (target_index < current_count) ? target_index : current_count;
-    for (int i = 0; i < copy_limit; i++) {
+    for (int i = 0; i < copy_limit && !error; i++) {
         if (!append_sentence(&merged, &merged_count, &merged_capacity, current_sentences[i])) {
-            free_string_array(current_sentences, current_count);
-            free_string_array(replacement, replacement_count);
-            free_string_array(merged, merged_count);
-            send_error(client, "UNKNOWN");
-            session_reset(session);
-            return;
+            error = "UNKNOWN";
         }
     }
-
-    for (int i = 0; i < replacement_count; i++) {
+    for (int i = 0; i < replacement_count && !error; i++) {
         if (!append_sentence(&merged, &merged_count, &merged_capacity, replacement[i])) {
-            free_string_array(current_sentences, current_count);
-            free_string_array(replacement, replacement_count);
-            free_string_array(merged, merged_count);
-            send_error(client, "UNKNOWN");
-            session_reset(session);
-            return;
+            error = "UNKNOWN";
         }
     }
-
     int start_index = current_count;
-    if (!session->append_mode) {
-        if (target_index < current_count) {
-            start_index = target_index + 1;
-        }
+    if (!session->append_mode && target_index < current_count) {
+        start_index = target_index + 1;
     }
-    for (int i = start_index; i < current_count; i++) {
+    for (int i = start_index; i < current_count && !error; i++) {
         if (!append_sentence(&merged, &merged_count, &merged_capacity, current_sentences[i])) {
-            free_string_array(current_sentences, current_count);
-            free_string_array(replacement, replacement_count);
-            free_string_array(merged, merged_count);
-            send_error(client, "UNKNOWN");
-            session_reset(session);
-            return;
+            error = "UNKNOWN";
         }
     }
+    if (error) {
+        goto done;
+    }
 
-    char *new_content = join_sentences(merged, merged_count);
+    new_content = join_sentences(merged, merged_count);
     if (!new_content) {
-        free_string_array(current_sentences, current_count);
-        free_string_array(replacement, replacement_count);
-        free_string_array(merged, merged_count);
-        send_error(client, "UNKNOWN");
-        session_reset(session);
-        return;
+        error = "UNKNOWN";
+        goto done;
     }
 
-    if (session->original_content) {
-        save_snapshot(session->filename, session->original_content);
+    // The snapshot is the version this commit replaces, so UNDO never
+    // reverts someone else's commit.
+    if (save_snapshot(session->filename, latest_content) != 0 ||
+        save_file_atomic(session->filename, new_content) != 0) {
+        error = "UNKNOWN";
     }
 
-    if (save_file_atomic(session->filename, new_content) != 0) {
-        free(new_content);
-        free_string_array(current_sentences, current_count);
-        free_string_array(replacement, replacement_count);
-        free_string_array(merged, merged_count);
-        send_error(client, "UNKNOWN");
-        session_reset(session);
-        return;
-    }
-
+done:
+    file_unlock(session->filename);
     free(new_content);
+    free(latest_content);
     free_string_array(current_sentences, current_count);
     free_string_array(replacement, replacement_count);
     free_string_array(merged, merged_count);
 
+    if (error) {
+        send_error(client, error);
+        session_reset(session);
+        return 0;
+    }
     send_ok_message(client, "WRITE DONE");
     session_reset(session);
+    return 1;
 }
